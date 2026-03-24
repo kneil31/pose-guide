@@ -525,7 +525,7 @@ body {
 </div>
 
 <script>
-const MANIFEST_URL = "chunks/manifest-b0637f99.enc";
+const MANIFEST_URL = "chunks/manifest-f30fde1f.enc";
 const PBKDF2_ITERATIONS = 400000;
 
 let manifestData = null;   // Decrypted manifest
@@ -969,11 +969,13 @@ function toggleGridDone(idx) {
 }
 
 function refreshGallery() {
+  const scrollY = window.scrollY;
   if (currentView === 'shotlist') openShotList();
   else if (currentView === 'category') {
     applyCategoryFilter();
     showGallery(CATEGORY_DISPLAY[currentCat] || currentCat);
   }
+  requestAnimationFrame(() => window.scrollTo(0, scrollY));
 }
 
 function clearShotList() {

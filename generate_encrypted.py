@@ -905,11 +905,13 @@ function toggleGridDone(idx) {{
 }}
 
 function refreshGallery() {{
+  const scrollY = window.scrollY;
   if (currentView === 'shotlist') openShotList();
   else if (currentView === 'category') {{
     applyCategoryFilter();
     showGallery(CATEGORY_DISPLAY[currentCat] || currentCat);
   }}
+  requestAnimationFrame(() => window.scrollTo(0, scrollY));
 }}
 
 function clearShotList() {{
