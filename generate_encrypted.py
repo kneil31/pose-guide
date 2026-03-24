@@ -469,6 +469,7 @@ let currentIdx = 0;
 let touchStartX = 0;
 let currentView = 'home';
 let currentCat = '';
+let shotlistFilter = 'remaining'; // 'all' | 'remaining' | 'done'
 let _password = '';
 
 // ── Crypto ──────────────────────────────────────────────────────────────
@@ -734,6 +735,13 @@ function openShotList() {{
     }}
   }}
   currentImages.sort((a, b) => (loved[a.id] || 0) - (loved[b.id] || 0));
+  shotlistFilter = 'remaining';
+  showGallery('Shot List');
+  document.getElementById('clearBtn').classList.add('visible');
+}}
+
+function setShotlistFilter(f) {{
+  shotlistFilter = f;
   showGallery('Shot List');
   document.getElementById('clearBtn').classList.add('visible');
 }}
@@ -760,16 +768,33 @@ function showGallery(title) {{
       else toShoot.push({{ img, i }});
     }});
 
-    let html = '<div class="shotlist-grid">';
-    if (toShoot.length) {{
-      html += `<div class="shotlist-section-label">\\ud83c\\udfaf To Shoot — ${{toShoot.length}} remaining</div>`;
-      html += toShoot.map(({{ img, i }}) => renderItem(img, i)).join('');
+    // Filter tabs
+    let html = '<div class="filter-tabs">';
+    html += `<button class="filter-tab${{shotlistFilter === 'remaining' ? ' active' : ''}}" onclick="setShotlistFilter('remaining')">Remaining (${{toShoot.length}})</button>`;
+    html += `<button class="filter-tab${{shotlistFilter === 'all' ? ' active' : ''}}" onclick="setShotlistFilter('all')">All (${{currentImages.length}})</button>`;
+    html += `<button class="filter-tab${{shotlistFilter === 'done' ? ' active done-tab' : ''}}" onclick="setShotlistFilter('done')">Done (${{finished.length}})</button>`;
+    html += '</div>';
+
+    html += '<div class="shotlist-grid">';
+    if (shotlistFilter === 'remaining' || shotlistFilter === 'all') {{
+      if (toShoot.length) {{
+        if (shotlistFilter === 'all') {{
+          html += `<div class="shotlist-section-label">\\ud83c\\udfaf To Shoot — ${{toShoot.length}} remaining</div>`;
+        }}
+        html += toShoot.map(({{ img, i }}) => renderItem(img, i)).join('');
+      }} else if (shotlistFilter === 'remaining') {{
+        html += '<div class="empty">All done! \\ud83c\\udf89</div>';
+      }}
     }}
-    if (finished.length) {{
-      html += `<div class="shotlist-section-label done-label">\\u2705 Done — ${{finished.length}} completed</div>`;
-      html += '<div class="shotlist-done-grid">';
-      html += finished.map(({{ img, i }}) => renderItem(img, i)).join('');
-      html += '</div>';
+    if (shotlistFilter === 'done' || shotlistFilter === 'all') {{
+      if (finished.length) {{
+        if (shotlistFilter === 'all') {{
+          html += `<div class="shotlist-section-label done-label">\\u2705 Done — ${{finished.length}} completed</div>`;
+        }}
+        html += finished.map(({{ img, i }}) => renderItem(img, i)).join('');
+      }} else if (shotlistFilter === 'done') {{
+        html += '<div class="empty">No poses marked done yet.</div>';
+      }}
     }}
     html += '</div>';
 
@@ -1246,6 +1271,35 @@ body {
 }
 .shotlist-done-grid .gallery-item {
   margin-bottom: 0;
+}
+
+/* Filter tabs */
+.filter-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px 4px;
+  justify-content: center;
+}
+.filter-tab {
+  background: #252525;
+  border: 1px solid #333;
+  color: #888;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 18px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.filter-tab.active {
+  background: rgba(168,85,247,0.15);
+  border-color: #a855f7;
+  color: #a855f7;
+}
+.filter-tab.done-tab {
+  background: rgba(76,175,80,0.15);
+  border-color: #4caf50;
+  color: #4caf50;
 }
 
 /* Responsive: iPad landscape */
