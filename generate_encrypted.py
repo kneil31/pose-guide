@@ -739,11 +739,13 @@ function toggleLovedFilter() {{
 }}
 
 function applyCategoryFilter() {{
+  const loved = getLoved();
   if (categoryLovedOnly) {{
-    const loved = getLoved();
     currentImages = allCategoryImages.filter(img => loved[img.id]);
   }} else {{
     currentImages = [...allCategoryImages];
+    // Loved images float to top
+    currentImages.sort((a, b) => (loved[b.id] ? 1 : 0) - (loved[a.id] ? 1 : 0));
   }}
   const btn = document.getElementById('lovedFilterBtn');
   btn.classList.toggle('active', categoryLovedOnly);

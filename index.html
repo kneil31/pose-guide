@@ -525,7 +525,7 @@ body {
 </div>
 
 <script>
-const MANIFEST_URL = "chunks/manifest-1db7c1dc.enc";
+const MANIFEST_URL = "chunks/manifest-9f471238.enc";
 const PBKDF2_ITERATIONS = 400000;
 
 let manifestData = null;   // Decrypted manifest
@@ -803,11 +803,13 @@ function toggleLovedFilter() {
 }
 
 function applyCategoryFilter() {
+  const loved = getLoved();
   if (categoryLovedOnly) {
-    const loved = getLoved();
     currentImages = allCategoryImages.filter(img => loved[img.id]);
   } else {
     currentImages = [...allCategoryImages];
+    // Loved images float to top
+    currentImages.sort((a, b) => (loved[b.id] ? 1 : 0) - (loved[a.id] ? 1 : 0));
   }
   const btn = document.getElementById('lovedFilterBtn');
   btn.classList.toggle('active', categoryLovedOnly);
