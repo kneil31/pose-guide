@@ -1,0 +1,10 @@
+# Local-only files
+images/*/
+dist/
+pose_guide.html
+manifest.js
+pose_guide_offline.html
+.secret
+.current_chunks.json
+.DS_Store
+__pycache__/
