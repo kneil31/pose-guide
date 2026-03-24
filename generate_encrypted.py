@@ -441,6 +441,7 @@ def generate_index_html(manifest_fname: str) -> str:
     <button class="back-btn" id="backBtn" onclick="goBack()">&#8592; Back</button>
     <h1 id="pageTitle">Pose Guide</h1>
     <button class="loved-filter-btn" id="lovedFilterBtn" onclick="toggleLovedFilter()">&#9829;</button>
+    <button class="share-btn" id="shareBtn" onclick="shareMyPicks()">Share Picks</button>
     <button class="clear-btn" id="clearBtn" onclick="clearShotList()">Clear All</button>
   </div>
   <div class="categories" id="categories"></div>
@@ -456,6 +457,7 @@ def generate_index_html(manifest_fname: str) -> str:
       <div class="lb-counter" id="lbCounter"></div>
     </div>
   </div>
+  <div class="toast" id="toast"></div>
 </div>
 
 <script>
@@ -558,14 +560,26 @@ document.getElementById('pwInput').addEventListener('keydown', async (e) => {{
   await tryUnlock(pw);
 }});
 
-// Check for ?k= convenience param
+// Check for ?k= convenience param (and optional ?picks=)
 (async () => {{
   const params = new URLSearchParams(location.search);
   const k = params.get('k');
+  const picks = params.get('picks');
   if (k) {{
-    // Clear from URL bar
+    // Clear from URL bar immediately
     history.replaceState(null, '', location.pathname);
     await tryUnlock(k);
+    // After successful unlock, load shared picks if present
+    if (picks && manifestData) {{
+      const ids = picks.split(',').filter(id => /^[0-9a-f]{{12}}$/.test(id));
+      if (ids.length) {{
+        const loved = {{}};
+        ids.forEach(id => {{ loved[id] = Date.now(); }});
+        saveLoved(loved);
+        renderCategories();
+        showToast('Loaded ' + ids.length + ' picks');
+      }}
+    }}
   }}
 }})();
 
@@ -623,6 +637,7 @@ function renderCategories() {{
     </div>`;
   }}).join('');
   el.innerHTML = html;
+  updateShareBtn();
 }}
 
 // ── Category Chunks ─────────────────────────────────────────────────────
@@ -861,6 +876,7 @@ function showGallery(title) {{
   }} else {{
     filterBtn.classList.remove('visible');
   }}
+  updateShareBtn();
 }}
 
 function goBack() {{
@@ -873,6 +889,7 @@ function goBack() {{
   document.getElementById('backBtn').classList.remove('visible');
   document.getElementById('lovedFilterBtn').classList.remove('visible', 'active');
   document.getElementById('clearBtn').classList.remove('visible');
+  document.getElementById('shareBtn').classList.remove('visible');
   currentView = 'home';
   renderCategories();
 }}
@@ -1001,6 +1018,36 @@ document.addEventListener('keydown', e => {{
   if (e.key === ' ' || e.key === 'l') {{ e.preventDefault(); toggleLove(); }}
   if (e.key === 'd') {{ e.preventDefault(); if (isLoved(currentImages[currentIdx].id)) toggleDone(); }}
 }});
+
+// ── Share Picks ──────────────────────────────────────────────────────────
+
+function shareMyPicks() {{
+  const loved = getLoved();
+  const ids = Object.keys(loved);
+  if (!ids.length) return;
+  const url = location.origin + location.pathname + '?k=' + encodeURIComponent(_password) + '&picks=' + ids.join(',');
+  navigator.clipboard.writeText(url).then(() => {{
+    showToast('Link copied! Send to your photographer');
+  }}).catch(() => {{
+    prompt('Copy this link:', url);
+  }});
+}}
+
+function showToast(msg) {{
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 3000);
+}}
+
+function updateShareBtn() {{
+  const btn = document.getElementById('shareBtn');
+  if (lovedCount() > 0 && (currentView === 'home' || currentView === 'shotlist')) {{
+    btn.classList.add('visible');
+  }} else {{
+    btn.classList.remove('visible');
+  }}
+}}
 </script>
 </body>
 </html>'''
@@ -1290,6 +1337,39 @@ body {
   margin-left: auto;
 }
 .clear-btn.visible { display: inline-block; }
+
+/* Share picks button */
+.share-btn {
+  display: none;
+  background: #a855f7;
+  border: none;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.share-btn.visible { display: inline-block; }
+
+/* Toast notification */
+.toast {
+  position: fixed;
+  bottom: 30px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #333;
+  color: #fff;
+  padding: 12px 24px;
+  border-radius: 12px;
+  font-size: 14px;
+  z-index: 200;
+  opacity: 0;
+  transition: opacity 0.3s;
+  pointer-events: none;
+}
+.toast.show { opacity: 1; }
 
 /* Shot List layout */
 .shotlist-grid {
