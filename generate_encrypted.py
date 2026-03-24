@@ -440,6 +440,7 @@ def generate_index_html(manifest_fname: str) -> str:
   <div class="header">
     <button class="back-btn" id="backBtn" onclick="goBack()">&#8592; Back</button>
     <h1 id="pageTitle">Pose Guide</h1>
+    <button class="loved-filter-btn" id="lovedFilterBtn" onclick="toggleLovedFilter()">&#9829;</button>
     <button class="clear-btn" id="clearBtn" onclick="clearShotList()">Clear All</button>
   </div>
   <div class="categories" id="categories"></div>
@@ -470,6 +471,8 @@ let touchStartX = 0;
 let currentView = 'home';
 let currentCat = '';
 let shotlistFilter = 'remaining'; // 'all' | 'remaining' | 'done'
+let categoryLovedOnly = false;     // filter loved-only in category view
+let allCategoryImages = [];        // unfiltered images for current category
 let _password = '';
 
 // ── Crypto ──────────────────────────────────────────────────────────────
@@ -698,7 +701,7 @@ async function openCategory(slug) {{
   const cat = manifestData.categories.find(c => c.slug === slug);
 
   // Build currentImages with blob URLs
-  currentImages = (cat ? cat.images : []).map(meta => {{
+  allCategoryImages = (cat ? cat.images : []).map(meta => {{
     const loaded = images.find(i => i.id === meta.id);
     return {{
       id: meta.id,
@@ -709,18 +712,38 @@ async function openCategory(slug) {{
     }};
   }});
 
+  categoryLovedOnly = false;
+  applyCategoryFilter();
   showGallery(CATEGORY_DISPLAY[slug] || slug);
+}}
+
+function toggleLovedFilter() {{
+  categoryLovedOnly = !categoryLovedOnly;
+  applyCategoryFilter();
+  showGallery(CATEGORY_DISPLAY[currentCat] || currentCat);
+}}
+
+function applyCategoryFilter() {{
+  if (categoryLovedOnly) {{
+    const loved = getLoved();
+    currentImages = allCategoryImages.filter(img => loved[img.id]);
+  }} else {{
+    currentImages = [...allCategoryImages];
+  }}
+  const btn = document.getElementById('lovedFilterBtn');
+  btn.classList.toggle('active', categoryLovedOnly);
 }}
 
 const CATEGORY_DISPLAY = {json.dumps({k: v for k, v in CATEGORY_DISPLAY.items()})};
 
-function openShotList() {{
+async function openShotList() {{
   currentView = 'shotlist';
   currentCat = '';
   const loved = getLoved();
 
-  // Collect all loved images from manifest (thumbnails only — no chunk fetch)
+  // Collect all loved images from manifest
   currentImages = [];
+  const neededSlugs = new Set();
   for (const cat of manifestData.categories) {{
     for (const img of cat.images) {{
       if (loved[img.id]) {{
@@ -731,11 +754,26 @@ function openShotList() {{
           key: img.id,
           category: cat.slug,
         }});
+        neededSlugs.add(cat.slug);
       }}
     }}
   }}
   currentImages.sort((a, b) => (loved[a.id] || 0) - (loved[b.id] || 0));
   shotlistFilter = 'remaining';
+
+  // Show immediately with thumbs, then upgrade to full-res
+  showGallery('Shot List');
+  document.getElementById('clearBtn').classList.add('visible');
+
+  // Fetch all needed category chunks in parallel
+  await Promise.all([...neededSlugs].map(slug => loadCategoryChunks(slug)));
+
+  // Upgrade image sources to full-res blob URLs
+  for (const img of currentImages) {{
+    const blobUrl = findBlobUrl(img.id);
+    if (blobUrl) img.src = blobUrl;
+  }}
+  // Re-render with full-res
   showGallery('Shot List');
   document.getElementById('clearBtn').classList.add('visible');
 }}
@@ -814,6 +852,15 @@ function showGallery(title) {{
 
   document.getElementById('pageTitle').textContent = title;
   document.getElementById('backBtn').classList.add('visible');
+
+  // Show heart filter in category view, hide in shot list
+  const filterBtn = document.getElementById('lovedFilterBtn');
+  if (currentView === 'category') {{
+    filterBtn.classList.add('visible');
+    filterBtn.classList.toggle('active', categoryLovedOnly);
+  }} else {{
+    filterBtn.classList.remove('visible');
+  }}
 }}
 
 function goBack() {{
@@ -824,6 +871,7 @@ function goBack() {{
   if (shotlistEl) shotlistEl.style.display = 'none';
   document.getElementById('pageTitle').textContent = 'Pose Guide';
   document.getElementById('backBtn').classList.remove('visible');
+  document.getElementById('lovedFilterBtn').classList.remove('visible', 'active');
   document.getElementById('clearBtn').classList.remove('visible');
   currentView = 'home';
   renderCategories();
@@ -841,7 +889,10 @@ function toggleGridDone(idx) {{
 
 function refreshGallery() {{
   if (currentView === 'shotlist') openShotList();
-  else if (currentView === 'category') showGallery(CATEGORY_DISPLAY[currentCat] || currentCat);
+  else if (currentView === 'category') {{
+    applyCategoryFilter();
+    showGallery(CATEGORY_DISPLAY[currentCat] || currentCat);
+  }}
 }}
 
 function clearShotList() {{
@@ -1271,6 +1322,27 @@ body {
 }
 .shotlist-done-grid .gallery-item {
   margin-bottom: 0;
+}
+
+/* Loved filter button in header */
+.loved-filter-btn {
+  display: none;
+  background: none;
+  border: 2px solid #444;
+  color: #666;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  font-size: 18px;
+  cursor: pointer;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+.loved-filter-btn.visible { display: flex; align-items: center; justify-content: center; }
+.loved-filter-btn.active {
+  border-color: #e74c6f;
+  color: #fff;
+  background: #e74c6f;
 }
 
 /* Filter tabs */
