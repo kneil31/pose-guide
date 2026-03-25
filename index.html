@@ -577,7 +577,7 @@ body {
 </div>
 
 <script>
-const MANIFEST_URL = "chunks/manifest-ed955c94.enc";
+const MANIFEST_URL = "chunks/manifest-469eeeb3.enc";
 const PBKDF2_ITERATIONS = 400000;
 
 let manifestData = null;   // Decrypted manifest
@@ -692,11 +692,13 @@ function migrateLegacyIds() {
   for (const cat of manifestData.categories) {
     for (const img of cat.images) {
       if (!img.legacy_id) continue;
+      // Move loved entry from legacy to new ID
       if (loved[img.legacy_id] && !loved[img.id]) {
         loved[img.id] = loved[img.legacy_id];
         delete loved[img.legacy_id];
         migrated++;
       }
+      // Move done entry from legacy to new ID
       if (done[img.legacy_id] && !done[img.id]) {
         done[img.id] = done[img.legacy_id];
         delete done[img.legacy_id];
