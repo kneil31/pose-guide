@@ -431,6 +431,26 @@ body {
   column-span: all;
 }
 
+/* Section header (Videos) */
+.section-header {
+  grid-column: 1 / -1;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  padding: 20px 4px 6px;
+  color: #888;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.section-header::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: #333;
+}
+
 /* Video play badge on gallery grid */
 .play-badge {
   position: absolute;
@@ -577,7 +597,7 @@ body {
 </div>
 
 <script>
-const MANIFEST_URL = "chunks/manifest-4bb2dec9.enc";
+const MANIFEST_URL = "chunks/manifest-7068e6fd.enc";
 const PBKDF2_ITERATIONS = 400000;
 
 let manifestData = null;   // Decrypted manifest
@@ -787,7 +807,10 @@ function renderCategories() {
     </div>`;
   }
 
-  html += manifestData.categories.map(cat => {
+  const poseCats = manifestData.categories.filter(c => c.section !== 'videos');
+  const videoCats = manifestData.categories.filter(c => c.section === 'videos');
+
+  html += poseCats.map(cat => {
     const loved = lovedCountForCat(cat.slug);
     return `<div class="tile" onclick="openCategory('${cat.slug}')">
       <div class="tile-accent"></div>
@@ -797,6 +820,21 @@ function renderCategories() {
       ${loved > 0 ? `<div class="tile-loved">\u2764 ${loved} selected</div>` : ''}
     </div>`;
   }).join('');
+
+  if (videoCats.length) {
+    html += '<div class="section-header">\ud83c\udfac Videos</div>';
+    html += videoCats.map(cat => {
+      const loved = lovedCountForCat(cat.slug);
+      return `<div class="tile" onclick="openCategory('${cat.slug}')">
+        <div class="tile-accent"></div>
+        <div class="tile-icon">${cat.icon}</div>
+        <div class="tile-name">${cat.name}</div>
+        <div class="tile-count">${cat.count} demo${cat.count !== 1 ? 's' : ''}</div>
+        ${loved > 0 ? `<div class="tile-loved">\u2764 ${loved} selected</div>` : ''}
+      </div>`;
+    }).join('');
+  }
+
   el.innerHTML = html;
   updateShareBtn();
 }

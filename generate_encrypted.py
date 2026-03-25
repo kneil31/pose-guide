@@ -422,14 +422,18 @@ def build(password: str) -> None:
                 all_chunk_info.append((slug, enc, len(images_data), enc_mb))
 
         vid_count = sum(1 for m in images_meta if "video" in m)
-        manifest_data["categories"].append({
+        is_video_only = slug in video_cats and slug not in categories
+        cat_entry = {
             "name": display,
             "slug": slug,
-            "icon": CATEGORY_ICONS.get(slug, "\U0001f4f7"),
+            "icon": CATEGORY_ICONS.get(slug, "\U0001f3ac" if is_video_only else "\U0001f4f7"),
             "count": len(images_meta),
             "chunks": chunk_filenames,
             "images": images_meta,
-        })
+        }
+        if is_video_only:
+            cat_entry["section"] = "videos"
+        manifest_data["categories"].append(cat_entry)
 
         img_label = f"{len(images_data)} images" if images_data else "0 images"
         vid_label = f" + {vid_count} videos" if vid_count else ""
@@ -843,7 +847,10 @@ function renderCategories() {{
     </div>`;
   }}
 
-  html += manifestData.categories.map(cat => {{
+  const poseCats = manifestData.categories.filter(c => c.section !== 'videos');
+  const videoCats = manifestData.categories.filter(c => c.section === 'videos');
+
+  html += poseCats.map(cat => {{
     const loved = lovedCountForCat(cat.slug);
     return `<div class="tile" onclick="openCategory('${{cat.slug}}')">
       <div class="tile-accent"></div>
@@ -853,6 +860,21 @@ function renderCategories() {{
       ${{loved > 0 ? `<div class="tile-loved">\\u2764 ${{loved}} selected</div>` : ''}}
     </div>`;
   }}).join('');
+
+  if (videoCats.length) {{
+    html += '<div class="section-header">\\ud83c\\udfac Videos</div>';
+    html += videoCats.map(cat => {{
+      const loved = lovedCountForCat(cat.slug);
+      return `<div class="tile" onclick="openCategory('${{cat.slug}}')">
+        <div class="tile-accent"></div>
+        <div class="tile-icon">${{cat.icon}}</div>
+        <div class="tile-name">${{cat.name}}</div>
+        <div class="tile-count">${{cat.count}} demo${{cat.count !== 1 ? 's' : ''}}</div>
+        ${{loved > 0 ? `<div class="tile-loved">\\u2764 ${{loved}} selected</div>` : ''}}
+      </div>`;
+    }}).join('');
+  }}
+
   el.innerHTML = html;
   updateShareBtn();
 }}
@@ -1782,6 +1804,26 @@ body {
   color: #666;
   font-size: 15px;
   column-span: all;
+}
+
+/* Section header (Videos) */
+.section-header {
+  grid-column: 1 / -1;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  padding: 20px 4px 6px;
+  color: #888;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.section-header::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: #333;
 }
 
 /* Video play badge on gallery grid */
