@@ -431,6 +431,55 @@ body {
   column-span: all;
 }
 
+/* Video play badge on gallery grid */
+.play-badge {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  width: 28px;
+  height: 28px;
+  background: rgba(0,0,0,0.6);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  z-index: 2;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  color: #fff;
+  pointer-events: none;
+}
+
+/* Lightbox video */
+.lightbox video {
+  max-width: 95vw;
+  max-height: 75vh;
+  object-fit: contain;
+  border-radius: 6px;
+  display: none;
+}
+.lb-play-demo {
+  display: none;
+  background: rgba(168,85,247,0.9);
+  border: none;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.lb-play-demo.visible { display: inline-block; }
+.lb-play-demo:active { transform: scale(0.95); }
+.lb-loading-video {
+  display: none;
+  color: #a855f7;
+  font-size: 13px;
+}
+.lb-loading-video.visible { display: inline-block; }
+
 /* Password gate */
 .pw-gate {
   display: flex;
@@ -515,9 +564,12 @@ body {
     <button class="lb-nav lb-prev" onclick="navLightbox(-1)">&#8249;</button>
     <button class="lb-nav lb-next" onclick="navLightbox(1)">&#8250;</button>
     <img id="lbImg" src="" alt="Pose reference">
+    <video id="lbVideo" controls playsinline muted></video>
     <div class="lb-bottom">
       <button class="lb-heart" id="lbHeart" onclick="toggleLove()">&#9829;</button>
       <button class="lb-check" id="lbCheck" onclick="toggleDone()">&#10003;</button>
+      <button class="lb-play-demo" id="lbPlayDemo" onclick="toggleVideoDemo()">&#9654; Play Demo</button>
+      <span class="lb-loading-video" id="lbLoadingVideo">Loading video...</span>
       <div class="lb-counter" id="lbCounter"></div>
     </div>
   </div>
@@ -540,6 +592,8 @@ let shotlistFilter = 'remaining'; // 'all' | 'remaining' | 'done'
 let categoryLovedOnly = false;     // filter loved-only in category view
 let allCategoryImages = [];        // unfiltered images for current category
 let _password = '';
+let videoBlobCache = {};          // pose id -> blob URL for decrypted videos
+let lbVideoMode = false;           // lightbox showing video vs photo
 
 // ── Crypto ──────────────────────────────────────────────────────────────
 
@@ -569,6 +623,19 @@ async function decryptChunk(url, password) {
   const key = await deriveKey(password, salt);
   const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
   return new TextDecoder().decode(plain);
+}
+
+async function decryptRawChunk(url, password) {
+  const buf = await fetch(url).then(r => {
+    if (!r.ok) throw new Error('Fetch failed: ' + r.status);
+    return r.arrayBuffer();
+  });
+  const bytes = new Uint8Array(buf);
+  const salt = bytes.slice(0, 16);
+  const iv = bytes.slice(16, 28);
+  const ciphertext = bytes.slice(28);
+  const key = await deriveKey(password, salt);
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
 }
 
 // ── Storage (localStorage, keyed by 12-char content-hash IDs) ───────────
@@ -615,6 +682,33 @@ function doneCount() {
   return Object.keys(done).filter(id => loved[id]).length;
 }
 
+// ── ID Migration (v1 content-hash → v2 stable IDs) ─────────────────────
+
+function migrateLegacyIds() {
+  if (!manifestData || !manifestData.categories) return;
+  const loved = getLoved();
+  const done = getDone();
+  let migrated = 0;
+  for (const cat of manifestData.categories) {
+    for (const img of cat.images) {
+      if (!img.legacy_id) continue;
+      if (loved[img.legacy_id] && !loved[img.id]) {
+        loved[img.id] = loved[img.legacy_id];
+        delete loved[img.legacy_id];
+        migrated++;
+      }
+      if (done[img.legacy_id] && !done[img.id]) {
+        done[img.id] = done[img.legacy_id];
+        delete done[img.legacy_id];
+      }
+    }
+  }
+  if (migrated > 0) {
+    saveLoved(loved);
+    saveDone(done);
+  }
+}
+
 // ── Password Gate ───────────────────────────────────────────────────────
 
 document.getElementById('pwInput').addEventListener('keydown', async (e) => {
@@ -657,6 +751,7 @@ async function tryUnlock(pw) {
     const json = await decryptChunk(MANIFEST_URL, pw);
     manifestData = JSON.parse(json);
     _password = pw;
+    migrateLegacyIds();
     document.getElementById('pwGate').style.display = 'none';
     document.getElementById('app').style.display = 'block';
     renderCategories();
@@ -709,6 +804,7 @@ function renderCategories() {
 function revokeOldBlobs() {
   blobUrls.forEach(u => URL.revokeObjectURL(u));
   blobUrls = [];
+  videoBlobCache = {};
 }
 
 async function loadCategoryChunks(slug) {
@@ -751,11 +847,12 @@ function renderItem(img, i) {
   const loved = isLoved(img.id);
   const done = isDone(img.id);
   const doneClass = (loved && done) ? ' shot-done' : '';
-  // Use thumbnail for shot list, blob URL for category gallery
   const src = img.src || img.thumb || '';
+  const playBadge = img.videoChunk ? '<div class="play-badge">\u25b6</div>' : '';
   return `<div class="gallery-item${doneClass}" onclick="openLightbox(${i})">
     <div class="heart-badge${loved ? ' loved' : ''}" onclick="event.stopPropagation(); toggleGrid(${i})">\u2661</div>
     ${loved ? `<div class="check-badge${done ? ' done' : ''}" onclick="event.stopPropagation(); toggleGridDone(${i})">\u2713</div>` : ''}
+    ${playBadge}
     <img src="${src}" loading="lazy" alt="Pose ${i+1}">
   </div>`;
 }
@@ -782,13 +879,18 @@ async function openCategory(slug) {
   // Build currentImages with blob URLs
   allCategoryImages = (cat ? cat.images : []).map(meta => {
     const loaded = images.find(i => i.id === meta.id);
-    return {
+    const item = {
       id: meta.id,
       src: loaded ? loaded.blobUrl : meta.thumb,
       thumb: meta.thumb,
       key: meta.id,
       category: slug,
     };
+    if (meta.video) {
+      item.videoChunk = meta.video.chunk;
+      item.videoMime = meta.video.mime || 'video/mp4';
+    }
+    return item;
   });
 
   categoryLovedOnly = false;
@@ -815,7 +917,7 @@ function applyCategoryFilter() {
   btn.classList.toggle('active', categoryLovedOnly);
 }
 
-const CATEGORY_DISPLAY = {"baby_shower": "Baby Shower", "maternity": "Maternity", "kids": "Kids", "newborn": "Newborn", "couples": "Couples", "family": "Family", "wedding": "Wedding", "uncategorized": "Uncategorized"};
+const CATEGORY_DISPLAY = {"baby_shower": "Baby Shower", "maternity": "Maternity", "kids": "Kids", "newborn": "Newborn", "couples": "Couples", "family": "Family", "wedding": "Wedding", "cradle": "Cradle", "uncategorized": "Uncategorized"};
 
 async function openShotList() {
   currentView = 'shotlist';
@@ -828,13 +930,18 @@ async function openShotList() {
   for (const cat of manifestData.categories) {
     for (const img of cat.images) {
       if (loved[img.id]) {
-        currentImages.push({
+        const item = {
           id: img.id,
           src: img.thumb,
           thumb: img.thumb,
           key: img.id,
           category: cat.slug,
-        });
+        };
+        if (img.video) {
+          item.videoChunk = img.video.chunk;
+          item.videoMime = img.video.mime || 'video/mp4';
+        }
+        currentImages.push(item);
         neededSlugs.add(cat.slug);
       }
     }
@@ -1020,11 +1127,13 @@ async function openLightbox(idx) {
 }
 
 function closeLightbox() {
+  resetVideoMode();
   document.getElementById('lightbox').classList.remove('open');
   refreshGallery();
 }
 
 function navLightbox(dir) {
+  resetVideoMode();
   currentIdx = (currentIdx + dir + currentImages.length) % currentImages.length;
   const img = currentImages[currentIdx];
 
@@ -1063,6 +1172,73 @@ function updateLightboxUI() {
   } else {
     check.classList.remove('visible', 'done');
   }
+  // Video demo button
+  const playBtn = document.getElementById('lbPlayDemo');
+  const loadingEl = document.getElementById('lbLoadingVideo');
+  loadingEl.classList.remove('visible');
+  if (img.videoChunk) {
+    playBtn.classList.add('visible');
+    playBtn.innerHTML = lbVideoMode ? '\ud83d\uddbc View Photo' : '\u25b6 Play Demo';
+  } else {
+    playBtn.classList.remove('visible');
+  }
+}
+
+async function toggleVideoDemo() {
+  const img = currentImages[currentIdx];
+  if (!img.videoChunk) return;
+
+  const videoEl = document.getElementById('lbVideo');
+  const imgEl = document.getElementById('lbImg');
+  const playBtn = document.getElementById('lbPlayDemo');
+  const loadingEl = document.getElementById('lbLoadingVideo');
+
+  if (lbVideoMode) {
+    // Switch back to photo
+    videoEl.pause();
+    videoEl.style.display = 'none';
+    imgEl.style.display = 'block';
+    lbVideoMode = false;
+    updateLightboxUI();
+    return;
+  }
+
+  // Switch to video — decrypt on demand
+  playBtn.classList.remove('visible');
+  loadingEl.classList.add('visible');
+
+  try {
+    let blobUrl = videoBlobCache[img.id];
+    if (!blobUrl) {
+      const decrypted = await decryptRawChunk('chunks/' + img.videoChunk, _password);
+      const blob = new Blob([decrypted], { type: img.videoMime || 'video/mp4' });
+      blobUrl = URL.createObjectURL(blob);
+      videoBlobCache[img.id] = blobUrl;
+      blobUrls.push(blobUrl);
+    }
+
+    videoEl.src = blobUrl;
+    imgEl.style.display = 'none';
+    videoEl.style.display = 'block';
+    lbVideoMode = true;
+    videoEl.play().catch(() => {});
+    loadingEl.classList.remove('visible');
+    updateLightboxUI();
+  } catch (e) {
+    loadingEl.classList.remove('visible');
+    playBtn.classList.add('visible');
+    showToast('Failed to load video');
+  }
+}
+
+function resetVideoMode() {
+  const videoEl = document.getElementById('lbVideo');
+  const imgEl = document.getElementById('lbImg');
+  videoEl.pause();
+  videoEl.removeAttribute('src');
+  videoEl.style.display = 'none';
+  imgEl.style.display = 'block';
+  lbVideoMode = false;
 }
 
 // ── Touch swipe ─────────────────────────────────────────────────────────
@@ -1085,6 +1261,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closeLightbox();
   if (e.key === ' ' || e.key === 'l') { e.preventDefault(); toggleLove(); }
   if (e.key === 'd') { e.preventDefault(); if (isLoved(currentImages[currentIdx].id)) toggleDone(); }
+  if (e.key === 'v') { e.preventDefault(); if (currentImages[currentIdx].videoChunk) toggleVideoDemo(); }
 });
 
 // ── Share Picks ──────────────────────────────────────────────────────────

@@ -17,6 +17,7 @@ import mimetypes
 import os
 import secrets
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -39,6 +40,7 @@ except ImportError:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 IMAGES_DIR = SCRIPT_DIR / "images"
+VIDEOS_DIR = SCRIPT_DIR / "videos"
 DIST_DIR = SCRIPT_DIR / "dist"
 SECRET_FILE = SCRIPT_DIR / ".secret"
 CHUNKS_DIR = SCRIPT_DIR / "chunks"
@@ -53,6 +55,9 @@ THUMB_LONG_EDGE = 80
 THUMB_QUALITY = 40
 JPEG_QUALITY = 82
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv"}
+VIDEO_WARN_DURATION = 30  # seconds
+VIDEO_WARN_SIZE_MB = 50   # encrypted chunk size
 
 DEFAULT_BASE_URL = "https://kneil31.github.io/pose-guide/"
 
@@ -64,6 +69,7 @@ CATEGORY_ICONS = {
     "couples": "\U0001f491",
     "family": "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466",
     "wedding": "\U0001f48d",
+    "cradle": "\U0001f6b6",
     "uncategorized": "\U0001f4f7",
 }
 
@@ -75,6 +81,7 @@ CATEGORY_DISPLAY = {
     "couples": "Couples",
     "family": "Family",
     "wedding": "Wedding",
+    "cradle": "Cradle",
     "uncategorized": "Uncategorized",
 }
 
@@ -104,6 +111,11 @@ def file_sha256(path: Path, length: int = 12) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()[:length]
+
+
+def pose_id(slug: str, stem: str, length: int = 12) -> str:
+    """Stable pose ID from category + basename. Survives image replacement."""
+    return hashlib.sha256(f"{slug}/{stem}".encode()).hexdigest()[:length]
 
 
 # ── Image processing ────────────────────────────────────────────────────────
@@ -151,6 +163,65 @@ def make_thumbnail_b64(src: Path) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+# ── Video processing ────────────────────────────────────────────────────────
+
+def get_video_duration(path: Path) -> float:
+    """Get video duration in seconds via ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(result.stdout.strip())
+    except (ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+def compress_video(src: Path, dest: Path) -> Path:
+    """Compress video to 720p muted MP4 via ffmpeg."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src),
+         "-c:v", "libx264", "-crf", "28", "-preset", "fast",
+         "-vf", "scale=-2:720", "-an",
+         "-movflags", "+faststart",
+         str(dest)],
+        capture_output=True, timeout=300,
+        check=True,
+    )
+    return dest
+
+
+def extract_poster(src: Path, dest: Path) -> Path:
+    """Extract a single frame at 0.5s as JPEG poster."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src),
+         "-ss", "0.5", "-vframes", "1",
+         "-q:v", "2", str(dest)],
+        capture_output=True, timeout=30,
+        check=True,
+    )
+    return dest
+
+
+def discover_videos() -> dict:
+    """Returns {slug: {basename_stem: source_path}}."""
+    videos = {}
+    if not VIDEOS_DIR.exists():
+        return videos
+    for cat_dir in sorted(VIDEOS_DIR.iterdir()):
+        if not cat_dir.is_dir() or cat_dir.name.startswith("."):
+            continue
+        slug = cat_dir.name.replace(" ", "_")
+        files = {}
+        for f in sorted(cat_dir.iterdir()):
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTS:
+                files[f.stem.lower()] = f
+        if files:
+            videos[slug] = files
+    return videos
+
+
 # ── Build pipeline ──────────────────────────────────────────────────────────
 
 def load_secret() -> str:
@@ -178,90 +249,179 @@ def discover_categories() -> dict:
 
 
 def build(password: str) -> None:
-    """Full build pipeline: optimize → IDs → thumbs → encrypt → index.html."""
+    """Full build pipeline: optimize → IDs → thumbs → video compress → encrypt → index.html."""
     categories = discover_categories()
-    if not categories:
-        print("No images found in images/")
+    video_cats = discover_videos()
+
+    # Merge category slugs (a category can exist from videos alone)
+    all_slugs = sorted(set(list(categories.keys()) + list(video_cats.keys())))
+    if not all_slugs:
+        print("No images or videos found")
         sys.exit(1)
 
     # Clean dist
     opt_dir = DIST_DIR / "optimized"
+    vid_dir = DIST_DIR / "videos"
     site_dir = DIST_DIR / "site"
     if DIST_DIR.exists():
         shutil.rmtree(DIST_DIR)
     opt_dir.mkdir(parents=True)
+    vid_dir.mkdir(parents=True)
     (site_dir / "chunks").mkdir(parents=True)
 
-    print(f"Found {sum(len(v) for v in categories.values())} images across {len(categories)} categories\n")
+    total_images = sum(len(v) for v in categories.values())
+    total_videos = sum(len(v) for v in video_cats.values())
+    print(f"Found {total_images} images + {total_videos} videos across {len(all_slugs)} categories\n")
 
-    # Phase 1: Optimize + generate IDs + thumbnails
-    manifest_data = {"version": 1, "categories": []}
-    all_chunk_info = []  # [(slug, encrypted_bytes, image_count)]
+    manifest_data = {"version": 2, "categories": []}
+    all_chunk_info = []  # [(name, encrypted_bytes, count, mb)]
+    video_warnings = []
 
-    for slug, source_files in categories.items():
+    for slug in all_slugs:
         display = CATEGORY_DISPLAY.get(slug, slug.replace("_", " ").title())
         cat_opt_dir = opt_dir / slug
-        cat_opt_dir.mkdir()
+        cat_opt_dir.mkdir(exist_ok=True)
+        cat_vid_dir = vid_dir / slug
+        cat_vid_dir.mkdir(exist_ok=True)
+
+        source_files = categories.get(slug, [])
+        video_files = video_cats.get(slug, {})  # {stem: path}
+
+        # Build image index by stem for pairing
+        image_by_stem = {}
+        for src in source_files:
+            image_by_stem[src.stem.lower()] = src
+
+        # Collect all unique pose stems (union of image + video stems)
+        all_stems = sorted(set(list(image_by_stem.keys()) + list(video_files.keys())))
 
         images_meta = []  # For manifest
-        images_data = []  # For chunk (full base64)
-
-        for src in source_files:
-            # Stable ID from original source file
-            img_id = file_sha256(src, 12)
-
-            # Optimize
-            opt_name = f"{slug}_{src.stem}{src.suffix.lower()}"
-            opt_path = cat_opt_dir / opt_name
-            actual_path = optimize_image(src, opt_path)
-
-            # Thumbnail from optimized
-            thumb_b64 = make_thumbnail_b64(actual_path)
-
-            # Full image base64 for chunk
-            mime = mimetypes.guess_type(actual_path.name)[0] or "image/jpeg"
-            img_b64 = base64.b64encode(actual_path.read_bytes()).decode("ascii")
-
-            images_meta.append({
-                "id": img_id,
-                "name": actual_path.name,
-                "thumb": f"data:image/jpeg;base64,{thumb_b64}",
-                "category": slug,
-            })
-            images_data.append({
-                "id": img_id,
-                "name": actual_path.name,
-                "mime": mime,
-                "b64": img_b64,
-            })
-
-        # Encrypt chunk(s) — split if > MAX_CHUNK_MB
-        chunk_json = json.dumps(images_data).encode("utf-8")
-        chunk_mb = len(chunk_json) / (1024 * 1024)
-
+        images_data = []  # For image chunk (full base64)
         chunk_filenames = []
-        if chunk_mb > MAX_CHUNK_MB:
-            # Split into parts
-            part_size = len(images_data) // 2
-            parts = [images_data[:part_size], images_data[part_size:]]
-            for i, part in enumerate(parts, 1):
-                part_bytes = json.dumps(part).encode("utf-8")
-                enc = encrypt_bytes(part_bytes, password)
+
+        for stem in all_stems:
+            has_image = stem in image_by_stem
+            has_video = stem in video_files
+
+            img_id = pose_id(slug, stem)
+            thumb_b64 = None
+
+            # Legacy content-hash ID for migration (existing loved/done data)
+            legacy_id = None
+
+            if has_image:
+                src = image_by_stem[stem]
+                legacy_id = file_sha256(src, 12)
+
+                # Optimize
+                opt_name = f"{slug}_{src.stem}{src.suffix.lower()}"
+                opt_path = cat_opt_dir / opt_name
+                actual_path = optimize_image(src, opt_path)
+
+                # Thumbnail from optimized
+                thumb_b64 = make_thumbnail_b64(actual_path)
+
+                # Full image base64 for chunk
+                mime = mimetypes.guess_type(actual_path.name)[0] or "image/jpeg"
+                img_b64 = base64.b64encode(actual_path.read_bytes()).decode("ascii")
+
+                images_data.append({
+                    "id": img_id,
+                    "name": actual_path.name,
+                    "mime": mime,
+                    "b64": img_b64,
+                })
+
+            # Process video
+            video_meta = None
+            if has_video:
+                vid_src = video_files[stem]
+
+                # Compress video
+                compressed_path = cat_vid_dir / f"{stem}.mp4"
+                print(f"    Compressing video: {vid_src.name}...", end=" ", flush=True)
+                try:
+                    compress_video(vid_src, compressed_path)
+                    comp_mb = compressed_path.stat().st_size / (1024 * 1024)
+                    print(f"{comp_mb:.1f} MB")
+                except subprocess.CalledProcessError as e:
+                    print(f"FAILED: {e}")
+                    continue
+
+                # Get duration
+                duration = get_video_duration(compressed_path)
+                if duration > VIDEO_WARN_DURATION:
+                    video_warnings.append(f"{vid_src.name}: {duration:.1f}s (>{VIDEO_WARN_DURATION}s)")
+
+                # Extract poster if no paired image (for thumbnail)
+                if not has_image:
+                    poster_path = cat_vid_dir / f"{stem}_poster.jpg"
+                    try:
+                        extract_poster(compressed_path, poster_path)
+                        thumb_b64 = make_thumbnail_b64(poster_path)
+                    except (subprocess.CalledProcessError, Exception):
+                        thumb_b64 = ""  # empty thumb fallback
+
+                # Encrypt video as raw bytes (NOT base64 JSON)
+                vid_bytes = compressed_path.read_bytes()
+                vid_enc = encrypt_bytes(vid_bytes, password)
+                vid_hash = content_hash(vid_enc)
+                vid_fname = f"{slug}_vid_{img_id}-{vid_hash}.enc"
+                (site_dir / "chunks" / vid_fname).write_bytes(vid_enc)
+
+                vid_enc_mb = len(vid_enc) / (1024 * 1024)
+                all_chunk_info.append((f"{slug}_vid_{stem}", vid_enc, 1, vid_enc_mb))
+
+                if vid_enc_mb > VIDEO_WARN_SIZE_MB:
+                    video_warnings.append(f"{vid_fname}: {vid_enc_mb:.1f} MB (>{VIDEO_WARN_SIZE_MB} MB)")
+
+                video_meta = {
+                    "chunk": vid_fname,
+                    "mime": "video/mp4",
+                    "duration": round(duration, 1),
+                }
+
+            # Build pose metadata
+            pose_meta = {
+                "id": img_id,
+                "name": stem,
+                "thumb": f"data:image/jpeg;base64,{thumb_b64}" if thumb_b64 else "",
+                "category": slug,
+            }
+            if legacy_id and legacy_id != img_id:
+                pose_meta["legacy_id"] = legacy_id
+            if video_meta:
+                pose_meta["video"] = video_meta
+
+            images_meta.append(pose_meta)
+
+        # Encrypt image chunk(s) — only if there are images
+        if images_data:
+            chunk_json = json.dumps(images_data).encode("utf-8")
+            chunk_mb = len(chunk_json) / (1024 * 1024)
+
+            if chunk_mb > MAX_CHUNK_MB:
+                part_size = len(images_data) // 2
+                parts = [images_data[:part_size], images_data[part_size:]]
+                for i, part in enumerate(parts, 1):
+                    part_bytes = json.dumps(part).encode("utf-8")
+                    enc = encrypt_bytes(part_bytes, password)
+                    h = content_hash(enc)
+                    fname = f"{slug}-{i}-{h}.enc"
+                    (site_dir / "chunks" / fname).write_bytes(enc)
+                    chunk_filenames.append(fname)
+                    part_mb = len(enc) / (1024 * 1024)
+                    all_chunk_info.append((f"{slug}-{i}", enc, len(part), part_mb))
+            else:
+                enc = encrypt_bytes(chunk_json, password)
                 h = content_hash(enc)
-                fname = f"{slug}-{i}-{h}.enc"
+                fname = f"{slug}-{h}.enc"
                 (site_dir / "chunks" / fname).write_bytes(enc)
                 chunk_filenames.append(fname)
-                part_mb = len(enc) / (1024 * 1024)
-                all_chunk_info.append((f"{slug}-{i}", enc, len(part), part_mb))
-        else:
-            enc = encrypt_bytes(chunk_json, password)
-            h = content_hash(enc)
-            fname = f"{slug}-{h}.enc"
-            (site_dir / "chunks" / fname).write_bytes(enc)
-            chunk_filenames.append(fname)
-            enc_mb = len(enc) / (1024 * 1024)
-            all_chunk_info.append((slug, enc, len(images_data), enc_mb))
+                enc_mb = len(enc) / (1024 * 1024)
+                all_chunk_info.append((slug, enc, len(images_data), enc_mb))
 
+        vid_count = sum(1 for m in images_meta if "video" in m)
         manifest_data["categories"].append({
             "name": display,
             "slug": slug,
@@ -271,7 +431,9 @@ def build(password: str) -> None:
             "images": images_meta,
         })
 
-        print(f"  {display}: {len(images_meta)} images → {len(chunk_filenames)} chunk(s)")
+        img_label = f"{len(images_data)} images" if images_data else "0 images"
+        vid_label = f" + {vid_count} videos" if vid_count else ""
+        print(f"  {display}: {img_label}{vid_label} → {len(chunk_filenames)} image chunk(s)")
 
     # Encrypt manifest
     manifest_json = json.dumps(manifest_data).encode("utf-8")
@@ -298,14 +460,16 @@ def build(password: str) -> None:
     # Build report
     print(f"\nBuild complete:")
     manifest_kb = len(manifest_enc) / 1024
-    total_images = sum(len(c["images"]) for c in manifest_data["categories"])
-    print(f"  {manifest_fname:40s} {manifest_kb:6.1f} KB  ({total_images} images, {len(manifest_data['categories'])} categories)")
+    total_poses = sum(len(c["images"]) for c in manifest_data["categories"])
+    total_vids = sum(1 for c in manifest_data["categories"] for img in c["images"] if "video" in img)
+    print(f"  {manifest_fname:40s} {manifest_kb:6.1f} KB  ({total_poses} poses, {total_vids} with video, {len(manifest_data['categories'])} categories)")
 
     total_mb = manifest_kb / 1024
     warnings = []
     failures = []
     for name, enc, count, mb in all_chunk_info:
-        print(f"  {name + '-' + content_hash(enc) + '.enc':40s} {mb:6.1f} MB  ({count} images)")
+        label = "video" if "_vid_" in name else f"{count} images"
+        print(f"  {name + '-' + content_hash(enc) + '.enc':40s} {mb:6.1f} MB  ({label})")
         total_mb += mb
         if mb > FAIL_CHUNK_MB:
             failures.append(name)
@@ -313,6 +477,11 @@ def build(password: str) -> None:
             warnings.append(name)
 
     print(f"  {'Total:':40s} {total_mb:6.1f} MB across {len(all_chunk_info) + 1} files")
+
+    if video_warnings:
+        print(f"\n  VIDEO WARNINGS:")
+        for w in video_warnings:
+            print(f"    {w}")
 
     if failures:
         print(f"\n  FAIL: Chunks over {FAIL_CHUNK_MB} MB: {', '.join(failures)}")
@@ -451,9 +620,12 @@ def generate_index_html(manifest_fname: str) -> str:
     <button class="lb-nav lb-prev" onclick="navLightbox(-1)">&#8249;</button>
     <button class="lb-nav lb-next" onclick="navLightbox(1)">&#8250;</button>
     <img id="lbImg" src="" alt="Pose reference">
+    <video id="lbVideo" controls playsinline muted></video>
     <div class="lb-bottom">
       <button class="lb-heart" id="lbHeart" onclick="toggleLove()">&#9829;</button>
       <button class="lb-check" id="lbCheck" onclick="toggleDone()">&#10003;</button>
+      <button class="lb-play-demo" id="lbPlayDemo" onclick="toggleVideoDemo()">&#9654; Play Demo</button>
+      <span class="lb-loading-video" id="lbLoadingVideo">Loading video...</span>
       <div class="lb-counter" id="lbCounter"></div>
     </div>
   </div>
@@ -476,6 +648,8 @@ let shotlistFilter = 'remaining'; // 'all' | 'remaining' | 'done'
 let categoryLovedOnly = false;     // filter loved-only in category view
 let allCategoryImages = [];        // unfiltered images for current category
 let _password = '';
+let videoBlobCache = {{}};          // pose id -> blob URL for decrypted videos
+let lbVideoMode = false;           // lightbox showing video vs photo
 
 // ── Crypto ──────────────────────────────────────────────────────────────
 
@@ -505,6 +679,19 @@ async function decryptChunk(url, password) {{
   const key = await deriveKey(password, salt);
   const plain = await crypto.subtle.decrypt({{ name: 'AES-GCM', iv }}, key, ciphertext);
   return new TextDecoder().decode(plain);
+}}
+
+async function decryptRawChunk(url, password) {{
+  const buf = await fetch(url).then(r => {{
+    if (!r.ok) throw new Error('Fetch failed: ' + r.status);
+    return r.arrayBuffer();
+  }});
+  const bytes = new Uint8Array(buf);
+  const salt = bytes.slice(0, 16);
+  const iv = bytes.slice(16, 28);
+  const ciphertext = bytes.slice(28);
+  const key = await deriveKey(password, salt);
+  return crypto.subtle.decrypt({{ name: 'AES-GCM', iv }}, key, ciphertext);
 }}
 
 // ── Storage (localStorage, keyed by 12-char content-hash IDs) ───────────
@@ -551,6 +738,35 @@ function doneCount() {{
   return Object.keys(done).filter(id => loved[id]).length;
 }}
 
+// ── ID Migration (v1 content-hash → v2 stable IDs) ─────────────────────
+
+function migrateLegacyIds() {{
+  if (!manifestData || !manifestData.categories) return;
+  const loved = getLoved();
+  const done = getDone();
+  let migrated = 0;
+  for (const cat of manifestData.categories) {{
+    for (const img of cat.images) {{
+      if (!img.legacy_id) continue;
+      // Move loved entry from legacy to new ID
+      if (loved[img.legacy_id] && !loved[img.id]) {{
+        loved[img.id] = loved[img.legacy_id];
+        delete loved[img.legacy_id];
+        migrated++;
+      }}
+      // Move done entry from legacy to new ID
+      if (done[img.legacy_id] && !done[img.id]) {{
+        done[img.id] = done[img.legacy_id];
+        delete done[img.legacy_id];
+      }}
+    }}
+  }}
+  if (migrated > 0) {{
+    saveLoved(loved);
+    saveDone(done);
+  }}
+}}
+
 // ── Password Gate ───────────────────────────────────────────────────────
 
 document.getElementById('pwInput').addEventListener('keydown', async (e) => {{
@@ -593,6 +809,7 @@ async function tryUnlock(pw) {{
     const json = await decryptChunk(MANIFEST_URL, pw);
     manifestData = JSON.parse(json);
     _password = pw;
+    migrateLegacyIds();
     document.getElementById('pwGate').style.display = 'none';
     document.getElementById('app').style.display = 'block';
     renderCategories();
@@ -645,6 +862,7 @@ function renderCategories() {{
 function revokeOldBlobs() {{
   blobUrls.forEach(u => URL.revokeObjectURL(u));
   blobUrls = [];
+  videoBlobCache = {{}};
 }}
 
 async function loadCategoryChunks(slug) {{
@@ -687,11 +905,12 @@ function renderItem(img, i) {{
   const loved = isLoved(img.id);
   const done = isDone(img.id);
   const doneClass = (loved && done) ? ' shot-done' : '';
-  // Use thumbnail for shot list, blob URL for category gallery
   const src = img.src || img.thumb || '';
+  const playBadge = img.videoChunk ? '<div class="play-badge">\\u25b6</div>' : '';
   return `<div class="gallery-item${{doneClass}}" onclick="openLightbox(${{i}})">
     <div class="heart-badge${{loved ? ' loved' : ''}}" onclick="event.stopPropagation(); toggleGrid(${{i}})">\\u2661</div>
     ${{loved ? `<div class="check-badge${{done ? ' done' : ''}}" onclick="event.stopPropagation(); toggleGridDone(${{i}})">\\u2713</div>` : ''}}
+    ${{playBadge}}
     <img src="${{src}}" loading="lazy" alt="Pose ${{i+1}}">
   </div>`;
 }}
@@ -718,13 +937,18 @@ async function openCategory(slug) {{
   // Build currentImages with blob URLs
   allCategoryImages = (cat ? cat.images : []).map(meta => {{
     const loaded = images.find(i => i.id === meta.id);
-    return {{
+    const item = {{
       id: meta.id,
       src: loaded ? loaded.blobUrl : meta.thumb,
       thumb: meta.thumb,
       key: meta.id,
       category: slug,
     }};
+    if (meta.video) {{
+      item.videoChunk = meta.video.chunk;
+      item.videoMime = meta.video.mime || 'video/mp4';
+    }}
+    return item;
   }});
 
   categoryLovedOnly = false;
@@ -764,13 +988,18 @@ async function openShotList() {{
   for (const cat of manifestData.categories) {{
     for (const img of cat.images) {{
       if (loved[img.id]) {{
-        currentImages.push({{
+        const item = {{
           id: img.id,
           src: img.thumb,
           thumb: img.thumb,
           key: img.id,
           category: cat.slug,
-        }});
+        }};
+        if (img.video) {{
+          item.videoChunk = img.video.chunk;
+          item.videoMime = img.video.mime || 'video/mp4';
+        }}
+        currentImages.push(item);
         neededSlugs.add(cat.slug);
       }}
     }}
@@ -956,11 +1185,13 @@ async function openLightbox(idx) {{
 }}
 
 function closeLightbox() {{
+  resetVideoMode();
   document.getElementById('lightbox').classList.remove('open');
   refreshGallery();
 }}
 
 function navLightbox(dir) {{
+  resetVideoMode();
   currentIdx = (currentIdx + dir + currentImages.length) % currentImages.length;
   const img = currentImages[currentIdx];
 
@@ -999,6 +1230,73 @@ function updateLightboxUI() {{
   }} else {{
     check.classList.remove('visible', 'done');
   }}
+  // Video demo button
+  const playBtn = document.getElementById('lbPlayDemo');
+  const loadingEl = document.getElementById('lbLoadingVideo');
+  loadingEl.classList.remove('visible');
+  if (img.videoChunk) {{
+    playBtn.classList.add('visible');
+    playBtn.innerHTML = lbVideoMode ? '\\ud83d\\uddbc View Photo' : '\\u25b6 Play Demo';
+  }} else {{
+    playBtn.classList.remove('visible');
+  }}
+}}
+
+async function toggleVideoDemo() {{
+  const img = currentImages[currentIdx];
+  if (!img.videoChunk) return;
+
+  const videoEl = document.getElementById('lbVideo');
+  const imgEl = document.getElementById('lbImg');
+  const playBtn = document.getElementById('lbPlayDemo');
+  const loadingEl = document.getElementById('lbLoadingVideo');
+
+  if (lbVideoMode) {{
+    // Switch back to photo
+    videoEl.pause();
+    videoEl.style.display = 'none';
+    imgEl.style.display = 'block';
+    lbVideoMode = false;
+    updateLightboxUI();
+    return;
+  }}
+
+  // Switch to video — decrypt on demand
+  playBtn.classList.remove('visible');
+  loadingEl.classList.add('visible');
+
+  try {{
+    let blobUrl = videoBlobCache[img.id];
+    if (!blobUrl) {{
+      const decrypted = await decryptRawChunk('chunks/' + img.videoChunk, _password);
+      const blob = new Blob([decrypted], {{ type: img.videoMime || 'video/mp4' }});
+      blobUrl = URL.createObjectURL(blob);
+      videoBlobCache[img.id] = blobUrl;
+      blobUrls.push(blobUrl);
+    }}
+
+    videoEl.src = blobUrl;
+    imgEl.style.display = 'none';
+    videoEl.style.display = 'block';
+    lbVideoMode = true;
+    videoEl.play().catch(() => {{}});
+    loadingEl.classList.remove('visible');
+    updateLightboxUI();
+  }} catch (e) {{
+    loadingEl.classList.remove('visible');
+    playBtn.classList.add('visible');
+    showToast('Failed to load video');
+  }}
+}}
+
+function resetVideoMode() {{
+  const videoEl = document.getElementById('lbVideo');
+  const imgEl = document.getElementById('lbImg');
+  videoEl.pause();
+  videoEl.removeAttribute('src');
+  videoEl.style.display = 'none';
+  imgEl.style.display = 'block';
+  lbVideoMode = false;
 }}
 
 // ── Touch swipe ─────────────────────────────────────────────────────────
@@ -1021,6 +1319,7 @@ document.addEventListener('keydown', e => {{
   if (e.key === 'Escape') closeLightbox();
   if (e.key === ' ' || e.key === 'l') {{ e.preventDefault(); toggleLove(); }}
   if (e.key === 'd') {{ e.preventDefault(); if (isLoved(currentImages[currentIdx].id)) toggleDone(); }}
+  if (e.key === 'v') {{ e.preventDefault(); if (currentImages[currentIdx].videoChunk) toggleVideoDemo(); }}
 }});
 
 // ── Share Picks ──────────────────────────────────────────────────────────
@@ -1483,7 +1782,56 @@ body {
   color: #666;
   font-size: 15px;
   column-span: all;
-}'''
+}
+
+/* Video play badge on gallery grid */
+.play-badge {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  width: 28px;
+  height: 28px;
+  background: rgba(0,0,0,0.6);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  z-index: 2;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  color: #fff;
+  pointer-events: none;
+}
+
+/* Lightbox video */
+.lightbox video {
+  max-width: 95vw;
+  max-height: 75vh;
+  object-fit: contain;
+  border-radius: 6px;
+  display: none;
+}
+.lb-play-demo {
+  display: none;
+  background: rgba(168,85,247,0.9);
+  border: none;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.lb-play-demo.visible { display: inline-block; }
+.lb-play-demo:active { transform: scale(0.95); }
+.lb-loading-video {
+  display: none;
+  color: #a855f7;
+  font-size: 13px;
+}
+.lb-loading-video.visible { display: inline-block; }'''
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
